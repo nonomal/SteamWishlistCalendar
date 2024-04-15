@@ -5,18 +5,13 @@ import os
 import re
 import requests
 import time
-import warnings
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from ics import Calendar, Event
 from matplotlib import pyplot
 from matplotlib import ticker
 
-# Ignores dateparser warnings regarding pytz.
-warnings.filterwarnings(
-    'ignore',
-    message='The localize method is no longer necessary, as this time zone supports the fold attribute',
-)
 
 _SEP = '-09-15'
 _TOTAL = 'total'
@@ -24,18 +19,36 @@ _RELEASE_DATE = 'release_date'
 _RELEASE_STRING = 'release_string'
 _RELEASED = 'released'
 _PRERELEASE = 'prerelease'
-_YEAR_REGEX = '^\\d{4}$'
+_YEAR_ONLY_REGEX = '^(\\d{4}) \\.$'
 
-_BLOCK_LIST = ('tbd', 'tba', 'to be announced', 'when it\'s done', 'when it\'s ready', '即将推出', 'coming soon')
-_TO_REMOVE = ('coming', 'wishlist now', '!', '--', 'wishlist and follow', 'play demo now',
-              'add to wishlist', 'wishlist to be notified', 'wishlist', '愿望单', '添加', 'now',
-              '(', ')', '（', '）', '↘', '↙', '↓', ':', '：')
+_BLOCK_LIST = ('tbd', 'tba', 'to be announced', 'when it\'s done', 'when it\'s ready', '即将推出', '即将宣布', 'coming soon')
 _TO_REPLACE = (
     ('spring', 'mar'), ('summer', 'june'), ('fall', 'sep'), ('winter', 'dec'),
     ('q1', 'feb'), ('q2', 'may'), ('q3', 'aug'), ('q4', 'nov'),
-    ('early 2', 'march 2'), ('late 2', 'sep 2'), ('年末', 'dec'), ('年底', 'dec'),
+    ('第一季度', 'feb'), ('第二季度', 'may'), ('第三季度', 'aug'), ('第四季度', 'nov'),
     ('年', '.'), ('月', '.'), ('日', '.'), ('号', '.')
 )
+
+
+def last_day_of_next_month(dt):
+    """
+    Returns the datetime of the last day of the next month.
+
+    Args:
+    dt: A datetime.datetime object.
+
+    Returns:
+    A datetime.datetime object.
+    """
+
+    year = dt.year
+    next_next_month = dt.month + 2
+    if next_next_month > 12:
+        next_next_month -= 12
+        year = dt.year + 1
+
+    # Subtracting 1 day from the first day of the next next month, to get the last day of next month.
+    return datetime(year, next_next_month, 1) - timedelta(days=1)
 
 
 parser = argparse.ArgumentParser()
@@ -48,7 +61,8 @@ if args.id.isnumeric():
     url = f'https://store.steampowered.com/wishlist/profiles/{args.id}/wishlistdata/'
 else:
     url = f'https://store.steampowered.com/wishlist/id/{args.id}/wishlistdata/'
-# l may also be 'english' or 'tchinese'. See https://partner.steamgames.com/doc/store/localization
+# l may also be 'english' or 'tchinese', but then _YEAR_ONLY_REGEX and _TO_REPLACE may need to be modified as well.
+# See https://partner.steamgames.com/doc/store/localization
 params = {'l': 'schinese'}
 count = 0
 prerelease_count = 0
@@ -71,8 +85,10 @@ for index in range(0, args.max_page):
         count += 1
         game_name = value['name']
         description_suffix = ''
+
         if value[_RELEASE_DATE]:
-            release_date = datetime.fromtimestamp(float(value[_RELEASE_DATE]))
+            release_date = datetime.fromtimestamp(float(value[_RELEASE_DATE]), tz=timezone.utc)
+
         if _PRERELEASE in value:
             prerelease_count += 1
             # Games that are not release yet will have a 'free-form' release string.
@@ -80,18 +96,19 @@ for index in range(0, args.max_page):
             if any(substring in release_string for substring in _BLOCK_LIST):
                 # Release date not announced.
                 continue
-            # Removes noises.
-            for w in _TO_REMOVE:
-                release_string = release_string.replace(w, '')
+
             # Heuristically maps vague words such as 'Q1', 'summer' to months.
             for pair in _TO_REPLACE:
                 release_string = release_string.replace(pair[0], pair[1])
+
             release_string = release_string.lstrip().rstrip()
-            if re.match(_YEAR_REGEX, release_string):
-                # Release string only contains a year.
+            year_only_match = re.match(_YEAR_ONLY_REGEX, release_string)
+            if year_only_match:
+                # Release string only contains information about the year.
+                year = year_only_match.group(1)
                 # If XXXX.09.15 has already passed, uses the last day of that year.
-                sep_release_date = datetime.strptime(release_string + _SEP, '%Y-%m-%d').date()
-                release_string += _SEP if sep_release_date > now.date() else '-12-31'
+                sep_release_date = datetime.strptime(year + _SEP, '%Y-%m-%d').date()
+                release_string = year + (_SEP if sep_release_date > now.date() else '-12-31')
 
             # Tries to parse a machine-readable date from the release string.
             translated_date = dateparser.parse(release_string,
@@ -100,6 +117,10 @@ for index in range(0, args.max_page):
                                                    'PREFER_DATES_FROM': 'future'})
             if translated_date:
                 release_date = translated_date
+                while release_date.date() < now.date():
+                    # A game is pre-release but the estimated release date has already passed. In this case, pick the earliest last-of-a-month date in the future.
+                    # Note the difference between this case and the case where only a year is provided, which has been addressed above.
+                    release_date = last_day_of_next_month(release_date)
                 description_suffix = f'\nEstimation based on "{value[_RELEASE_STRING]}"'
             else:
                 failed_deductions.append(f'{game_name}\t\t{value[_RELEASE_STRING]}')
@@ -107,15 +128,18 @@ for index in range(0, args.max_page):
 
         if not release_date:
             continue
+
         successful_deductions.append(f'{game_name}\t\t{release_date.date()}')
         if value['type'] == 'DLC' and not args.include_dlc:
             continue
+
         event = Event(uid=key, name=game_name,
                       description='https://store.steampowered.com/app/' + key + description_suffix,
                       begin=release_date, last_modified=now,
                       categories=['game_release'])
         event.make_all_day()
         cal.events.add(event)
+
     time.sleep(3)
 
 
@@ -141,8 +165,9 @@ os.makedirs(_OUTPUT_FOLDER, exist_ok=True)
 
 with open(_OUTPUT_FOLDER + _SUCCESS_FILE, 'w', encoding='utf-8') as f:
     f.write('\n'.join(successful_deductions))
-with open(_OUTPUT_FOLDER + _FAILURE_FILE, 'w', encoding='utf-8') as f:
-    f.write('\n'.join(failed_deductions))
+if failed_deductions:
+    with open(_OUTPUT_FOLDER + _FAILURE_FILE, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(failed_deductions))
 with open(_OUTPUT_FOLDER + _ICS_FILE, 'w', encoding='utf-8') as f:
     f.write(cal.serialize())
 
